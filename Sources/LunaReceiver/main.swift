@@ -46,6 +46,7 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
     private var cursorHidden = false
     private var mode: Mode = .fullscreen
     private var streamSize: CGSize?
+    private var streamHello: (width: Int, height: Int, fps: Int, name: String)?
     private var modeMenuItem: NSMenuItem!
     private var fullscreenObserver: NSObjectProtocol?
     // Set while waiting for a green-button (Spaces) fullscreen exit animation
@@ -59,13 +60,29 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
+        let loopbackOnly = CommandLine.arguments.contains("--loopback-only")
+        server.onMessage = { [weak self] message, label in
+            self?.handle(message, via: label) ?? false
+        }
+        server.onDisconnected = { [weak self] in
+            guard let self else { return }
+            self.pipeline.reset()
+            self.streamHello = nil
+            self.isStreaming = false
+            guard !self.headless else { return }
+            self.preventDisplaySleep(false)
+            self.showWaiting()
+        }
         if headless {
-            server.onMessage = { [weak self] message in self?.handle(message) }
-            server.start()
+            server.start(loopbackOnly: loopbackOnly)
             return
         }
 
-        let screen = NSScreen.main ?? NSScreen.screens[0]
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            lunaLog("luna: no screen available for the receiver")
+            NSApp.terminate(nil)
+            return
+        }
 
         window = ReceiverWindow(
             contentRect: screen.frame,
@@ -119,16 +136,7 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
             self.listeningText = address
             self.showWaiting()
         }
-        server.onMessage = { [weak self] message in
-            self?.handle(message)
-        }
-        server.onDisconnected = { [weak self] in
-            guard let self else { return }
-            self.pipeline.reset()
-            self.preventDisplaySleep(false)
-            self.showWaiting()
-        }
-        server.start()
+        server.start(loopbackOnly: loopbackOnly)
         showWaiting()
     }
 
@@ -184,7 +192,7 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setMode(_ newMode: Mode) {
-        guard newMode != mode else { return }
+        guard let window, newMode != mode else { return }
 
         if newMode == .fullscreen, window.styleMask.contains(.fullScreen) {
             // In green-button (Spaces) fullscreen: leave it first, then take
@@ -200,8 +208,7 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.title = "Luna Receiver"
             window.collectionBehavior = [.fullScreenPrimary]
-            let screen = window.screen ?? NSScreen.main ?? NSScreen.screens[0]
-            let avail = screen.visibleFrame
+            let avail = (window.screen ?? NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? window.frame
             let aspect = streamSize ?? CGSize(width: 16, height: 9)
             window.contentAspectRatio = aspect
             let scale = min(0.7 * avail.width / aspect.width, 0.7 * avail.height / aspect.height)
@@ -209,8 +216,9 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
             window.center()
         case .fullscreen:
             window.styleMask = .borderless
-            let screen = window.screen ?? NSScreen.main ?? NSScreen.screens[0]
-            window.setFrame(screen.frame, display: true)
+            if let screen = window.screen ?? NSScreen.main ?? NSScreen.screens.first {
+                window.setFrame(screen.frame, display: true)
+            }
         }
         modeMenuItem.title =
             mode == .fullscreen ? "Switch to Windowed Mode" : "Switch to Full Screen Mode"
@@ -219,32 +227,42 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
     }
 
-    private func handle(_ message: LunaMessage) {
+    private func handle(_ message: LunaMessage, via label: String?) -> Bool {
         switch message {
         case .hello(let w, let h, let fps, let name):
-            lunaLog("luna: sender %@ streaming %dx%d@%d", name, w, h, fps)
-            guard !headless else { return }
-            let via = server.connectionInterfaceLabel.map { " via \($0)" } ?? ""
+            guard streamHello == nil, VideoPipeline.supportsSize(width: w, height: h),
+                  (1...240).contains(fps), name.utf8.count <= 256 else { return false }
+            streamHello = (w, h, fps, name)
+            guard !headless else { return false }
+            let via = label.map { " via \($0)" } ?? ""
             statusField.stringValue = "Connected to \(name)\(via)…"
             streamSize = CGSize(width: CGFloat(w), height: CGFloat(h))
             if mode == .windowed, let size = streamSize {
                 window.contentAspectRatio = size
-                let width = window.contentLayoutRect.width
-                window.setContentSize(NSSize(width: width, height: width * size.height / size.width))
+                let maxHeight = window.screen?.visibleFrame.height ?? window.frame.height
+                let scale = min(window.contentLayoutRect.width / size.width, maxHeight / size.height)
+                window.setContentSize(NSSize(width: size.width * scale, height: size.height * scale))
             }
-            isStreaming = true
-            applyChrome()
-            preventDisplaySleep(true)
         case .paramSets(let sps, let pps):
-            guard !headless else { return }
+            guard streamHello != nil else { return false }
             pipeline.setParameterSets(sps: sps, pps: pps)
-            statusField.isHidden = true
-        case .frame(let pts, _, let data):
-            guard !headless else { return }
-            pipeline.enqueue(ptsMicros: pts, data: data)
+        case .frame(let pts, let keyframe, let data):
+            guard let hello = streamHello,
+                  pipeline.enqueue(ptsMicros: pts, keyframe: keyframe, data: data) else { return false }
+            if !isStreaming {
+                lunaLog("luna: sender %@ streaming %dx%d@%d", hello.name, hello.width, hello.height, hello.fps)
+                isStreaming = true
+                if !headless {
+                    statusField.isHidden = true
+                    applyChrome()
+                    preventDisplaySleep(true)
+                }
+            }
+            return true
         case .capture, .caps, .camParamSets, .camFrame, .audio, .captureStatus:
             break
         }
+        return false
     }
 
     private func showWaiting() {

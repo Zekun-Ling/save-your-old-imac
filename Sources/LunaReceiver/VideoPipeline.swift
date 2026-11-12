@@ -9,6 +9,7 @@ import CoreMedia
 final class VideoPipeline {
     let layer = AVSampleBufferDisplayLayer()
     private var formatDescription: CMVideoFormatDescription?
+    private var needsKeyframe = true
 
     init() {
         layer.videoGravity = .resizeAspect
@@ -17,10 +18,22 @@ final class VideoPipeline {
 
     func reset() {
         formatDescription = nil
-        layer.flush()
+        needsKeyframe = true
+        layer.flushAndRemoveImage()
+    }
+
+    static func supportsSize(width: Int, height: Int) -> Bool {
+        // Leave room above Luna's 4K preset while bounding decoder surfaces.
+        (16...8192).contains(width) && (16...8192).contains(height) &&
+            width * height <= 16_777_216
     }
 
     func setParameterSets(sps: Data, pps: Data) {
+        formatDescription = nil
+        needsKeyframe = true
+        guard let spsType = sps.first, spsType & 0x1F == 7,
+              let ppsType = pps.first, ppsType & 0x1F == 8 else { return }
+
         var desc: CMVideoFormatDescription?
         let status: OSStatus = sps.withUnsafeBytes { spsRaw in
             pps.withUnsafeBytes { ppsRaw in
@@ -43,20 +56,31 @@ final class VideoPipeline {
             lunaLog("luna: could not create format description (%d)", status)
             return
         }
+        let size = CMVideoFormatDescriptionGetDimensions(desc)
+        guard Self.supportsSize(width: Int(size.width), height: Int(size.height)) else { return }
         formatDescription = desc
         layer.flush()
     }
 
-    func enqueue(ptsMicros: Int64, data: Data) {
-        guard let formatDescription else { return }
+    func enqueue(ptsMicros: Int64, keyframe: Bool, data: Data) -> Bool {
+        guard let formatDescription else { return false }
 
         if #available(macOS 11.0, *), layer.requiresFlushToResumeDecoding {
             layer.flush()
+            needsKeyframe = true
         }
         if layer.status == .failed {
             lunaLog("luna: display layer failed (%@), flushing", layer.error?.localizedDescription ?? "?")
             layer.flush()
+            needsKeyframe = true
         }
+        guard !needsKeyframe || keyframe else { return false }
+        guard let hasIDR = Self.validateAVCC(data) else {
+            needsKeyframe = true
+            return false
+        }
+        guard !needsKeyframe || hasIDR else { return false }
+        needsKeyframe = true
 
         var blockBuffer: CMBlockBuffer?
         var status = CMBlockBufferCreateWithMemoryBlock(
@@ -70,7 +94,7 @@ final class VideoPipeline {
             flags: 0,
             blockBufferOut: &blockBuffer
         )
-        guard status == noErr, let blockBuffer else { return }
+        guard status == noErr, let blockBuffer else { return false }
 
         status = data.withUnsafeBytes { raw -> OSStatus in
             guard let base = raw.baseAddress else { return -1 }
@@ -81,7 +105,7 @@ final class VideoPipeline {
                 dataLength: data.count
             )
         }
-        guard status == noErr else { return }
+        guard status == noErr else { return false }
 
         var timing = CMSampleTimingInfo(
             duration: .invalid,
@@ -101,7 +125,7 @@ final class VideoPipeline {
             sampleSizeArray: &sampleSize,
             sampleBufferOut: &sampleBuffer
         )
-        guard status == noErr, let sampleBuffer else { return }
+        guard status == noErr, let sampleBuffer else { return false }
 
         // Render as soon as decoded; we chase lowest latency, not smoothness.
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) as? [NSMutableDictionary],
@@ -110,5 +134,28 @@ final class VideoPipeline {
         }
 
         layer.enqueue(sampleBuffer)
+        LatencyTrace.mark(.enqueued, ptsMicros: ptsMicros)
+        needsKeyframe = false
+        return true
+    }
+
+    /// Validate AVCC lengths before handing network bytes to Core Media.
+    /// A well-formed access unit returns whether it contains an IDR picture.
+    private static func validateAVCC(_ data: Data) -> Bool? {
+        data.withUnsafeBytes { bytes in
+            guard !bytes.isEmpty else { return nil }
+            var offset = 0
+            var hasIDR = false
+            while offset < bytes.count {
+                guard bytes.count - offset >= 5 else { return nil }
+                let length = (Int(bytes[offset]) << 24) | (Int(bytes[offset + 1]) << 16) |
+                    (Int(bytes[offset + 2]) << 8) | Int(bytes[offset + 3])
+                offset += 4
+                guard length > 0, length <= bytes.count - offset else { return nil }
+                if bytes[offset] & 0x1F == 5 { hasIDR = true }
+                offset += length
+            }
+            return hasIDR
+        }
     }
 }

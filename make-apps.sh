@@ -8,22 +8,44 @@ cd "$(dirname "$0")"
 VERSION=0.3.0
 BUILD=$(date +%Y%m%d%H%M)
 
-swift build -c release --arch arm64 --arch x86_64
-BIN=.build/apple/Products/Release
+# LUNA_BIN can point to already-built universal binaries.
+# SwiftPM is broken on some command-line-tools-only installs ("Invalid
+# manifest ... PackageDescription"); build-swiftc.sh produces the same
+# universal binaries without it. LUNA_USE_SWIFTC=1 forces that path.
+if [ -n "${LUNA_BIN:-}" ]; then
+  BIN=$LUNA_BIN
+elif [ -z "${LUNA_USE_SWIFTC:-}" ] && swift build -c release --arch arm64 --arch x86_64; then
+  BIN=.build/apple/Products/Release
+else
+  echo "NOTE: swift build unavailable, using build-swiftc.sh" >&2
+  ./build-swiftc.sh
+  BIN=.build-swiftc/universal
+fi
+for app in LunaSender LunaReceiver; do
+  if [ ! -x "$BIN/$app" ]; then
+    echo "ERROR: executable not found: $BIN/$app" >&2
+    exit 1
+  fi
+done
 
-rm -rf dist
-mkdir -p dist
+# Keep the existing apps and archives until the replacements have passed
+# signature verification and, when enabled, notarization.
+DIST=${LUNA_DIST_DIR:-dist}
+mkdir -p "$DIST"
+STAGE=$(mktemp -d "$DIST/.luna-build.XXXXXXXX")
+trap 'rm -rf "$STAGE"' EXIT
 
 # --- Signing identity -------------------------------------------------------
-IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
-  | awk -F'"' '/Developer ID Application/{print $2; exit}')
+IDENTITY=
+if [ "${LUNA_ADHOC:-0}" != 1 ]; then
+  IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk -F'"' '/Developer ID Application/ && !found++ {print $2}')
+fi
 if [ -n "$IDENTITY" ]; then
   echo "Signing as: $IDENTITY"
 else
   IDENTITY="-"
-  echo "NOTE: no Developer ID Application identity; signing ad-hoc." >&2
-  echo "      The apps still work — the first launch on another Mac needs" >&2
-  echo "      right-click -> Open (Gatekeeper)." >&2
+  echo "NOTE: signing ad-hoc; the apps will not be notarized." >&2
 fi
 
 sign() {  # sign <path>
@@ -52,7 +74,7 @@ PL
 }
 
 # --- LunaSender.app -----------------------------------------------------------
-SENDER=dist/LunaSender.app
+SENDER=$STAGE/LunaSender.app
 mkdir -p "$SENDER/Contents/MacOS"
 cp "$BIN/LunaSender" "$SENDER/Contents/MacOS/LunaSender"
 {
@@ -73,7 +95,7 @@ PL
 sign "$SENDER"
 
 # --- LunaReceiver.app ---------------------------------------------------------
-RECEIVER=dist/LunaReceiver.app
+RECEIVER=$STAGE/LunaReceiver.app
 mkdir -p "$RECEIVER/Contents/MacOS"
 cp "$BIN/LunaReceiver" "$RECEIVER/Contents/MacOS/LunaReceiver"
 {
@@ -92,7 +114,8 @@ PL
 } > "$RECEIVER/Contents/Info.plist"
 sign "$RECEIVER"
 
-codesign --verify --strict "$SENDER" && codesign --verify --strict "$RECEIVER"
+codesign --verify --strict "$SENDER"
+codesign --verify --strict "$RECEIVER"
 
 # --- Notarize --------------------------------------------------------------
 # Notarized apps open on other Macs without the right-click -> Open step.
@@ -102,7 +125,7 @@ if [ "$IDENTITY" != "-" ] && [ -z "${LUNA_NO_NOTARIZE:-}" ]; then
   if xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
     echo "Notarizing with keychain profile '$NOTARY_PROFILE'…"
     submission_id() {  # submission_id <app> -> submit a zip of it, print the id
-      local zip="dist/.$(basename "$1" .app).zip"
+      local zip="$STAGE/.$(basename "$1" .app).zip"
       rm -f "$zip"
       ditto -c -k --keepParent "$1" "$zip"
       xcrun notarytool submit "$zip" --keychain-profile "$NOTARY_PROFILE" --output-format json \
@@ -110,8 +133,8 @@ if [ "$IDENTITY" != "-" ] && [ -z "${LUNA_NO_NOTARIZE:-}" ]; then
     }
     sender_id=$(submission_id "$SENDER")
     receiver_id=$(submission_id "$RECEIVER")
-    for pair in "$SENDER:$sender_id" "$RECEIVER:$receiver_id"; do
-      app=${pair%%:*}; id=${pair##*:}
+    for app in "$SENDER" "$RECEIVER"; do
+      if [ "$app" = "$SENDER" ]; then id=$sender_id; else id=$receiver_id; fi
       status=$(xcrun notarytool wait "$id" --keychain-profile "$NOTARY_PROFILE" --output-format json \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
       if [ "$status" != "Accepted" ]; then
@@ -129,33 +152,12 @@ if [ "$IDENTITY" != "-" ] && [ -z "${LUNA_NO_NOTARIZE:-}" ]; then
   fi
 fi
 
+for app in LunaSender.app LunaReceiver.app; do
+  rm -rf "$DIST/$app"
+  mv "$STAGE/$app" "$DIST/$app"
+done
+
 echo
 echo "Built:"
-echo "  dist/LunaSender.app    (the Mac whose display is extended, macOS 13+)"
-echo "  dist/LunaReceiver.app  (copy to the Mac acting as the monitor, macOS 10.15+)"
-
-# --- Deploy the sender to /Applications when a copy lives there -------------
-# Developer ID signing keeps the Screen Recording grant stable across
-# rebuilds; the one-time switch from an ad-hoc build orphans the old grant,
-# so reset it when the team changes.
-APP=/Applications/LunaSender.app
-if [ -d "$APP" ] && [ -z "${LUNA_NO_DEPLOY:-}" ]; then
-  old_team=$(codesign -dvv "$APP" 2>&1 | awk -F= '/^TeamIdentifier/{print $2}')
-  new_team=$(codesign -dvv "$SENDER" 2>&1 | awk -F= '/^TeamIdentifier/{print $2}')
-  old_hash=$(codesign -dvvv "$APP" 2>&1 | awk -F= '/^CDHash/{print $2}')
-  new_hash=$(codesign -dvvv "$SENDER" 2>&1 | awk -F= '/^CDHash/{print $2}')
-  if [ "$old_hash" != "$new_hash" ]; then
-    pkill -x LunaSender 2>/dev/null || true
-    rm -rf "$APP"
-    ditto "$SENDER" "$APP"
-    echo
-    echo "Deployed to /Applications (new build)."
-    if [ "$old_team" != "$new_team" ]; then
-      tccutil reset ScreenCapture local.luna.sender >/dev/null 2>&1 || true
-      echo "Signing identity changed: macOS will ask for Screen Recording once on next launch."
-    fi
-  else
-    echo
-    echo "/Applications/LunaSender.app is already this exact build."
-  fi
-fi
+echo "  $DIST/LunaSender.app    (the Mac whose display is extended, macOS 13+)"
+echo "  $DIST/LunaReceiver.app  (copy to the Mac acting as the monitor, macOS 10.15+)"

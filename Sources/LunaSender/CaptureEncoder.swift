@@ -5,8 +5,7 @@ import CoreVideo
 import LunaProto
 import LunaMedia
 
-/// Captures a display with ScreenCaptureKit and encodes it to H.264,
-/// emitting wire-ready packets.
+/// Captures and encodes one virtual display, emitting wire-ready packets.
 @available(macOS 12.3, *)
 final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
     struct Config {
@@ -17,20 +16,22 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
         var bitrate: Int
     }
 
+    private enum State { case idle, active, stopped }
+
     private let config: Config
     private let captureQueue = DispatchQueue(label: "luna.capture", qos: .userInteractive)
+    // Capture discovery, stream ownership and VideoToolbox submissions share captureQueue.
+    private var state: State = .idle
     private var stream: SCStream?
     private var encoder: H264Encoder?
 
-    /// Called with wire-ready packets (paramSets / frame envelopes).
-    var onPacket: ((Data) -> Void)?
+    /// Configure callbacks before calling start().
+    var onPacket: ((_ data: Data, _ tracePTS: Int64?) -> Void)?
     /// Return true when the network is backed up and this frame should be
     /// dropped before encoding (frame-rate adapts, stream stays valid).
     var shouldDropFrame: (() -> Bool)?
+    var onStarted: (() -> Void)?
     var onError: ((String) -> Void)?
-
-    var framesSent: Int { encoder?.framesEncoded ?? 0 }
-    private(set) var framesDropped = 0
 
     init(config: Config) {
         self.config = config
@@ -38,6 +39,38 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func start() {
+        // Give the new virtual display a moment to appear in ScreenCaptureKit.
+        captureQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.state == .idle else { return }
+            self.state = .active
+            self.findDisplay(attempt: 0)
+        }
+    }
+
+    private func findDisplay(attempt: Int) {
+        guard state == .active else { return }
+        if attempt > 0 {
+            lunaLog("luna: retrying capture start (attempt %d)", attempt)
+        }
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, error in
+            self?.captureQueue.async { [weak self] in
+                guard let self, self.state == .active else { return }
+                if let error {
+                    self.onError?("Screen capture unavailable: \(error.localizedDescription)")
+                } else if let display = content?.displays.first(where: { $0.displayID == self.config.displayID }) {
+                    self.startStream(display: display)
+                } else if attempt < 10 {
+                    self.captureQueue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                        self?.findDisplay(attempt: attempt + 1)
+                    }
+                } else {
+                    self.onError?("Virtual display not found by ScreenCaptureKit")
+                }
+            }
+        }
+    }
+
+    private func startStream(display: SCDisplay) {
         guard let encoder = H264Encoder(config: .init(
             width: config.streamWidth, height: config.streamHeight, fps: config.fps, bitrate: config.bitrate
         )) else {
@@ -45,28 +78,14 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         encoder.onParameterSets = { [weak self] sps, pps in
-            self?.onPacket?(LunaWire.paramSetsData(sps: sps, pps: pps))
+            self?.onPacket?(LunaWire.paramSetsData(sps: sps, pps: pps), nil)
         }
         encoder.onEncodedFrame = { [weak self] pts, keyframe, avcc in
-            self?.onPacket?(LunaWire.frameData(ptsMicros: pts, keyframe: keyframe, avcc: avcc))
+            let tracePTS = LatencyTrace.enabled ? pts : nil
+            if let tracePTS { LatencyTrace.mark(.encoded, ptsMicros: tracePTS) }
+            self?.onPacket?(LunaWire.frameData(ptsMicros: pts, keyframe: keyframe, avcc: avcc), tracePTS)
         }
-        self.encoder = encoder
 
-        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, error in
-            guard let self else { return }
-            if let error {
-                self.onError?("Screen capture unavailable: \(error.localizedDescription)")
-                return
-            }
-            guard let display = content?.displays.first(where: { $0.displayID == self.config.displayID }) else {
-                self.onError?("Virtual display not found by ScreenCaptureKit")
-                return
-            }
-            self.startStream(display: display)
-        }
-    }
-
-    private func startStream(display: SCDisplay) {
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let conf = SCStreamConfiguration()
         conf.width = config.streamWidth
@@ -83,27 +102,37 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
             onError?("Could not attach capture output: \(error.localizedDescription)")
             return
         }
-        stream.startCapture { [weak self] error in
-            if let error {
-                self?.onError?("Could not start capture: \(error.localizedDescription)")
-            } else {
-                lunaLog("luna: capture started on display %u", self?.config.displayID ?? 0)
+        self.encoder = encoder
+        self.stream = stream
+        stream.startCapture { [weak self, weak stream] error in
+            self?.captureQueue.async { [weak self, weak stream] in
+                guard let self, let stream, self.stream === stream else { return }
+                if let error {
+                    self.onError?("Could not start capture: \(error.localizedDescription)")
+                } else {
+                    lunaLog("luna: capture started on display %u", self.config.displayID)
+                    self.onStarted?()
+                }
             }
         }
-        self.stream = stream
     }
 
     func stop() {
-        stream?.stopCapture { _ in }
-        stream = nil
-        encoder?.invalidate()
-        encoder = nil
+        captureQueue.sync {
+            state = .stopped
+            let activeStream = stream
+            stream = nil
+            activeStream?.stopCapture { _ in }
+            encoder?.invalidate()
+            encoder = nil
+        }
     }
 
     // MARK: - SCStreamOutput
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen,
+        guard self.stream === stream,
+              type == .screen,
               sampleBuffer.isValid,
               let attachments = (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[String: Any]])?.first,
               let statusRaw = attachments[SCStreamFrameInfo.status.rawValue] as? Int,
@@ -112,14 +141,18 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
               let encoder
         else { return }
 
-        if shouldDropFrame?() == true {
-            framesDropped += 1
-            return
+        guard shouldDropFrame?() != true else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if LatencyTrace.enabled, pts.isNumeric {
+            LatencyTrace.mark(.captured, ptsMicros: Int64(CMTimeGetSeconds(pts) * 1_000_000))
         }
-        encoder.encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        encoder.encode(pixelBuffer, pts: pts)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        onError?("Capture stopped: \(error.localizedDescription)")
+        captureQueue.async { [weak self, weak stream] in
+            guard let self, let stream, self.stream === stream else { return }
+            self.onError?("Capture stopped: \(error.localizedDescription)")
+        }
     }
 }

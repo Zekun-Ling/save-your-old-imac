@@ -161,21 +161,27 @@ public final class LunaMessageParser {
         guard !corrupted else { return [] }
         buffer.append(data)
         var out: [LunaMessage] = []
-        while true {
-            guard buffer.count >= 5 else { break }
-            let type = byte(at: 0)
-            let length = Int(u32LE(at: 1))
+        var consumed = 0
+        while buffer.count - consumed >= 5 {
+            let type = byte(at: consumed)
+            let length = Int(u32LE(at: consumed + 1))
             guard length <= Self.maxPayloadLength else {
                 corrupted = true
                 buffer.removeAll()
-                break
+                return out
             }
-            guard buffer.count >= 5 + length else { break }
-            let payload = buffer.subdata(in: index(5) ..< index(5 + length))
-            buffer.removeSubrange(buffer.startIndex ..< index(5 + length))
+            let payloadStart = consumed + 5
+            guard buffer.count - payloadStart >= length else { break }
+            consumed = payloadStart + length
+            let payload = buffer.subdata(in: index(payloadStart) ..< index(consumed))
             if let msg = Self.decode(type: type, payload: payload) {
                 out.append(msg)
             }
+        }
+        // Compact once per read. Removing each envelope moves the remaining
+        // bytes repeatedly, which a peer can exploit with many tiny messages.
+        if consumed > 0 {
+            buffer.removeSubrange(buffer.startIndex ..< index(consumed))
         }
         return out
     }

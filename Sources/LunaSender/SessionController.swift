@@ -12,6 +12,8 @@ enum DisplayPreset: String, CaseIterable {
     case retina4K
     case plain1440
 
+    static let fps = 60
+
     var title: String {
         switch self {
         case .retina5KScaled: return "Retina 5K scaled — looks like 2560×1440 (best)"
@@ -65,7 +67,7 @@ final class SessionController {
     private var resolver: ServiceResolver?
     private var encoder: CaptureEncoder?
     private var sleepAssertion: IOPMAssertionID = 0
-    private let fps = 60
+    private let fps = DisplayPreset.fps
 
     private(set) var state: State = .idle {
         didSet { onStateChange?(state) }
@@ -91,14 +93,11 @@ final class SessionController {
     /// Exposed for the --test-disconnect harness.
     var activeVirtualDisplayID: CGDirectDisplayID { virtualDisplay.displayID }
 
-    // Roughly three stream-sized frames; beyond this the link is backed up
-    // and we drop frames pre-encode so latency doesn't snowball.
-    private var maxPendingBytes: Int {
-        preset.bitrate / 8 / fps * 3
-    }
-
+    /// Until the user picks a mode in the menu, stream at the panel size of a
+    /// 1080p/1440p iMac (Late 2012/2013): 2560×1440 at 40 Mbps is far lighter
+    /// on an older decoder and on Wi-Fi than the 4K/70 Mbps Retina modes.
     private var preset: DisplayPreset {
-        DisplayPreset(rawValue: UserDefaults.standard.string(forKey: "preset") ?? "") ?? .retina5KScaled
+        DisplayPreset(rawValue: UserDefaults.standard.string(forKey: "preset") ?? "") ?? .plain1440
     }
 
     func connect(endpoint: NWEndpoint, name: String) {
@@ -106,76 +105,94 @@ final class SessionController {
         lastConnectError = nil
         state = .connecting(name)
 
+        let pinnedInterface: NWInterface?
+        if let pinName = Self.pinnedInterfaceName {
+            guard let interface = InterfaceMonitor.shared.interface(named: pinName) else {
+                let error = "Pinned interface \(pinName) has no usable path"
+                lastConnectError = error
+                lunaLog("luna: %@", error)
+                disconnect()
+                return
+            }
+            pinnedInterface = interface
+        } else {
+            pinnedInterface = nil
+        }
+
         // NWConnection stalls when a Bonjour service endpoint meets
         // prohibitedInterfaceTypes, so for the wired-first probe we resolve
         // the service to host:port ourselves and dial the host directly.
         // The plain service connect stays as the fallback.
         guard case .service(let sname, let stype, let sdomain, _) = endpoint else {
-            attemptConnection(endpoint: endpoint, fallback: endpoint, name: name, wiredOnly: true)
+            attemptConnection(endpoint: endpoint, fallback: endpoint, name: name,
+                              wiredOnly: pinnedInterface == nil, pinnedInterface: pinnedInterface)
             return
         }
-        let resolver = ServiceResolver { [weak self] result in
-            guard let self, self.resolver != nil, case .connecting = self.state else { return }
+        let resolveStarted = DispatchTime.now()
+        let resolver = ServiceResolver { [weak self] resolver, result in
+            guard let self, self.resolver === resolver else { return }
             self.resolver = nil
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - resolveStarted.uptimeNanoseconds) / 1_000_000
             if let result, let port = NWEndpoint.Port(rawValue: result.port) {
-                lunaLog("luna: resolved %@ -> %@:%d", sname, result.host, Int(result.port))
+                lunaLog("luna: SRV resolved %@ -> %@:%d in %.1f ms (interface index %u)",
+                        sname, result.host, Int(result.port), elapsed, result.interfaceIndex)
                 self.attemptConnection(
                     endpoint: .hostPort(host: NWEndpoint.Host(result.host), port: port),
-                    fallback: endpoint, name: name, wiredOnly: true
+                    fallback: endpoint, name: name, wiredOnly: pinnedInterface == nil, pinnedInterface: pinnedInterface
                 )
             } else {
-                lunaLog("luna: SRV resolve failed, connecting via service endpoint")
-                self.attemptConnection(endpoint: endpoint, fallback: endpoint, name: name, wiredOnly: false)
+                lunaLog("luna: SRV resolve failed after %.1f ms, connecting via service endpoint", elapsed)
+                self.attemptConnection(endpoint: endpoint, fallback: endpoint, name: name,
+                                       wiredOnly: false, pinnedInterface: pinnedInterface)
             }
         }
         self.resolver = resolver
-        resolver.resolve(name: sname, type: stype, domain: sdomain)
+        let interfaceIndex = pinnedInterface.flatMap { UInt32(exactly: $0.index) } ?? 0
+        resolver.resolve(name: sname, type: stype, domain: sdomain, interfaceIndex: interfaceIndex)
     }
 
     /// Probe the wired path (Thunderbolt bridge / Ethernet) first; if none
     /// exists within a couple of seconds, reconnect over any interface.
-    private func attemptConnection(endpoint: NWEndpoint, fallback: NWEndpoint, name: String, wiredOnly: Bool) {
-        // A pinned interface replaces the wired-first probe entirely; a pin
-        // with no usable path right now falls back to automatic (logged).
-        var pinnedInterface: NWInterface?
-        if let pinName = Self.pinnedInterfaceName {
-            if let iface = InterfaceMonitor.shared.interface(named: pinName) {
-                pinnedInterface = iface
-            } else {
-                lunaLog("luna: pinned interface %@ has no usable path, connecting automatically", pinName)
-            }
-        }
-        let conn: SenderConnection
-        if let pinnedInterface {
-            conn = SenderConnection(endpoint: endpoint, requiredInterface: pinnedInterface)
-        } else {
-            conn = SenderConnection(endpoint: endpoint, wiredOnly: wiredOnly)
-        }
+    private func attemptConnection(endpoint: NWEndpoint, fallback: NWEndpoint, name: String,
+                                   wiredOnly: Bool, pinnedInterface: NWInterface?) {
+        let conn = SenderConnection(endpoint: endpoint, wiredOnly: wiredOnly, requiredInterface: pinnedInterface)
+        let mode = pinnedInterface != nil ? "pinned" : (wiredOnly ? "wired probe" : "default routing")
+        let connectStarted = DispatchTime.now()
         connection = conn
         var didConnect = false  // both callbacks fire on the main queue
-        conn.onReady = { [weak self, weak conn] in
+        conn.onReady = { [weak self, weak conn] interface in
+            guard let self, let conn, self.connection === conn else { return }
             didConnect = true
-            self?.currentInterfaceLabel = conn?.readyInterface.map(InterfaceMonitor.label(for:))
-            lunaLog("luna: connected via %@ (%@ path)",
-                    self?.currentInterfaceLabel ?? "unknown interface",
-                    pinnedInterface != nil ? "pinned" : (wiredOnly ? "wired" : "default"))
-            self?.onStateChange?(self?.state ?? .idle)  // refresh the menu's "via" line
-            self?.handleConnected(name: name)
+            self.currentInterfaceLabel = interface.map(InterfaceMonitor.label(for:)) ?? "unknown interface"
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - connectStarted.uptimeNanoseconds) / 1_000_000
+            lunaLog("luna: connected via %@ (type %@, %@) in %.1f ms",
+                    self.currentInterfaceLabel ?? "unknown interface",
+                    interface.map { String(describing: $0.type) } ?? "unknown", mode, elapsed)
+            self.onStateChange?(self.state)  // refresh the menu's "via" line
+            self.handleConnected(name: name)
         }
         conn.onClosed = { [weak self, weak conn] reason in
             // Only react to the connection we currently own; a connection we
             // already replaced reporting closure must not kill the new one.
             guard let self, let conn, self.connection === conn else { return }
-            if let reason { lunaLog("luna: connection closed: %@", reason) }
+            if let reason {
+                if didConnect {
+                    lunaLog("luna: connection closed: %@", reason)
+                } else {
+                    let elapsed = Double(DispatchTime.now().uptimeNanoseconds - connectStarted.uptimeNanoseconds) / 1_000_000
+                    lunaLog("luna: %@ connect failed after %.1f ms: %@", mode, elapsed, reason)
+                }
+            }
             if let pinnedInterface, !didConnect {
                 // The user chose this interface; failing is better than
                 // silently using another one.
                 self.lastConnectError =
                     "Could not reach \(name) via \(InterfaceMonitor.label(for: pinnedInterface))"
                 self.disconnect()
-            } else if wiredOnly, pinnedInterface == nil, !didConnect {
-                lunaLog("luna: no wired path to receiver, falling back to Wi-Fi")
-                self.attemptConnection(endpoint: fallback, fallback: fallback, name: name, wiredOnly: false)
+            } else if wiredOnly, !didConnect {
+                lunaLog("luna: wired probe unsuccessful, retrying with default routing")
+                self.attemptConnection(endpoint: fallback, fallback: fallback, name: name,
+                                       wiredOnly: false, pinnedInterface: nil)
             } else {
                 self.disconnect()
             }
@@ -195,13 +212,6 @@ final class SessionController {
         let pixels = preset.displayPixels
         let stream = preset.streamSize
 
-        connection.send(LunaWire.helloData(
-            streamWidth: stream.width,
-            streamHeight: stream.height,
-            fps: fps,
-            senderName: Host.current().localizedName ?? "Mac"
-        ))
-
         guard virtualDisplay.create(
             pixelWidth: pixels.width,
             pixelHeight: pixels.height,
@@ -214,15 +224,16 @@ final class SessionController {
             return
         }
 
-        // The new display takes a moment to appear in ScreenCaptureKit.
-        startCapture(attempt: 0)
+        connection.send(LunaWire.helloData(
+            streamWidth: stream.width,
+            streamHeight: stream.height,
+            fps: fps,
+            senderName: Host.current().localizedName ?? "Mac"
+        ))
+        startCapture(connection: connection, preset: preset)
     }
 
-    private func startCapture(attempt: Int) {
-        guard let connection, virtualDisplay.isActive else { return }
-        if attempt > 0 {
-            lunaLog("luna: retrying capture start (attempt %d)", attempt)
-        }
+    private func startCapture(connection: SenderConnection, preset: DisplayPreset) {
         let encoder = CaptureEncoder(config: .init(
             displayID: virtualDisplay.displayID,
             streamWidth: preset.streamSize.width,
@@ -231,45 +242,42 @@ final class SessionController {
             bitrate: preset.bitrate
         ))
         self.encoder = encoder
-        encoder.onPacket = { [weak connection] packet in
-            connection?.send(packet)
+        encoder.onPacket = { [weak connection] packet, tracePTS in
+            connection?.send(packet, ptsMicros: tracePTS)
         }
-        encoder.shouldDropFrame = { [weak self, weak connection] in
-            guard let self, let connection else { return true }
-            return connection.pendingBytes > self.maxPendingBytes
+        // About three average frames. Drop before encoding to preserve H.264 dependencies.
+        let maxPendingBytes = preset.bitrate / 8 / fps * 3
+        encoder.shouldDropFrame = { [weak connection] in
+            guard let connection else { return true }
+            return connection.pendingBytes > maxPendingBytes
+        }
+        encoder.onStarted = { [weak self, weak encoder] in
+            DispatchQueue.main.async {
+                guard let self, let encoder, self.encoder === encoder,
+                      case .connecting(let name) = self.state else { return }
+                self.preventSleep(true)
+                self.state = .streaming(name)
+            }
         }
         encoder.onError = { [weak self, weak encoder] message in
             DispatchQueue.main.async {
                 // Ignore late errors from an encoder we already replaced.
                 guard let self, let encoder, self.encoder === encoder else { return }
-                if message.contains("not found"), attempt < 10 {
-                    // Display not registered with SCK yet; retry shortly.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        self.startCapture(attempt: attempt + 1)
-                    }
-                } else {
-                    lunaLog("luna: %@", message)
-                    self.disconnect()
-                }
+                lunaLog("luna: %@", message)
+                self.disconnect()
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + (attempt == 0 ? 0.5 : 0)) { [weak self] in
-            guard let self, self.encoder === encoder else { return }
-            encoder.start()
-            if case .connecting(let name) = self.state {
-                self.state = .streaming(name)
-            }
-            self.preventSleep(true)
-        }
+        encoder.start()
     }
 
     func disconnect() {
+        resolver?.cancel()
         resolver = nil
         currentInterfaceLabel = nil
-        encoder?.stop()
-        encoder = nil
         connection?.cancel()
         connection = nil
+        encoder?.stop()
+        encoder = nil
         virtualDisplay.destroy()
         preventSleep(false)
         if state != .idle { state = .idle }

@@ -1,5 +1,10 @@
 .build/
+.build-swiftc/
+.build-swiftc-cache/
 dist/
 .DS_Store
 .swiftpm/
 signing/*.provisionprofile
+signing/*.mobileprovision
+signing/*.p12
+signing/*.p8

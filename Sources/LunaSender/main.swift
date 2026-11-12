@@ -1,62 +1,65 @@
 import AppKit
 import CoreGraphics
-import CVD
 
-// --selftest: try virtual display configurations, print what the system
-// actually registered for each, then tear down. Verifies the private API
-// works on this macOS without needing screen-recording permission.
-if CommandLine.arguments.contains("--selftest") {
-    func report(_ vd: VirtualDisplaySession) {
-        let id = vd.displayID
-        let bounds = CGDisplayBounds(id)
-        print("  bounds=\(Int(bounds.width))x\(Int(bounds.height)) points")
-        if let mode = CGDisplayCopyDisplayMode(id) {
-            print("  current: \(mode.width)x\(mode.height) points, \(mode.pixelWidth)x\(mode.pixelHeight) pixels, \(mode.refreshRate) Hz")
+// --selftest: verify all presets through the same display setup as a
+// streaming session, without Screen Recording or a receiver.
+@MainActor
+func runDisplaySelftest() async -> Int32 {
+    func waitUntil(_ condition: () -> Bool) async -> Bool {
+        let deadline = DispatchTime.now() + 2
+        while !condition() {
+            guard DispatchTime.now() < deadline else { return false }
+            try? await Task.sleep(nanoseconds: 50_000_000)
         }
-        for m in VirtualDisplaySession.allModes(id) where m.pixelWidth >= 1920 {
-            let tag = m.pixelWidth != m.width ? "  <-- HiDPI" : ""
-            print("  mode: \(m.width)x\(m.height) points, \(m.pixelWidth)x\(m.pixelHeight) pixels\(tag)")
-        }
+        return true
     }
-
-    struct Attempt {
-        let label: String
-        let hiDPIValue: UInt32
-        let modes: [(UInt32, UInt32)]
-    }
-    let attempts = [
-        Attempt(label: "hiDPI=1, mode in points (2560x1440)", hiDPIValue: 1, modes: [(2560, 1440)]),
-        Attempt(label: "hiDPI=2, mode in points (2560x1440)", hiDPIValue: 2, modes: [(2560, 1440)]),
-        Attempt(label: "hiDPI=1, modes points+pixels", hiDPIValue: 1, modes: [(2560, 1440), (5120, 2880)]),
-        Attempt(label: "hiDPI=2, mode in pixels (5120x2880)", hiDPIValue: 2, modes: [(5120, 2880)]),
-    ]
 
     let vd = VirtualDisplaySession()
-    for attempt in attempts {
-        print("SELFTEST \(attempt.label)")
+    var passed = 0
+    for preset in DisplayPreset.allCases {
+        print("SELFTEST \(preset.rawValue)")
+        let pixels = preset.displayPixels
+        let scale = preset.hiDPI ? 2 : 1
         guard vd.create(
-            maxPixels: (5120, 2880),
-            hiDPIValue: attempt.hiDPIValue,
-            modes: attempt.modes,
-            targetPointWidth: 2560,
-            targetPixelWidth: 5120,
-            refreshHz: 60,
+            pixelWidth: pixels.width, pixelHeight: pixels.height,
+            hiDPI: preset.hiDPI, refreshHz: Double(DisplayPreset.fps),
             name: "Luna Selftest"
         ) else {
             print("  FAILED to create")
             continue
         }
-        Thread.sleep(forTimeInterval: 1.5)
-        report(vd)
+        let id = vd.displayID
+        let modeOK = await waitUntil {
+            guard VirtualDisplaySession.isOnline(id) == true,
+                  let mode = CGDisplayCopyDisplayMode(id) else { return false }
+            return mode.width == Int(pixels.width) / scale && mode.height == Int(pixels.height) / scale &&
+                mode.pixelWidth == Int(pixels.width) && mode.pixelHeight == Int(pixels.height) &&
+                abs(mode.refreshRate - Double(DisplayPreset.fps)) < 0.5
+        }
+        if let mode = CGDisplayCopyDisplayMode(id) {
+            print("  current: \(mode.width)x\(mode.height) points, \(mode.pixelWidth)x\(mode.pixelHeight) pixels, \(mode.refreshRate) Hz")
+        }
+        if !modeOK { print("  FAILED to register the expected online display mode") }
         vd.destroy()
-        Thread.sleep(forTimeInterval: 0.5)
+        let removed = await waitUntil { VirtualDisplaySession.isOnline(id) == false }
+        if !removed { print("  FAILED to remove the virtual display") }
+        if modeOK && removed { passed += 1 }
     }
-    print("SELFTEST done")
-    exit(0)
+    let total = DisplayPreset.allCases.count
+    print("SELFTEST \(passed == total ? "PASS" : "FAIL") — \(passed)/\(total) production presets registered and removed")
+    return passed == total ? 0 : 1
 }
 
 let app = NSApplication.shared
-if #available(macOS 13.0, *) {
+if CommandLine.arguments.contains("--selftest") {
+    // Run AppKit's event loop so CoreGraphics sees display topology changes.
+    app.setActivationPolicy(.prohibited)
+    Task { @MainActor in
+        let result = await runDisplaySelftest()
+        exit(result)
+    }
+    app.run()
+} else if #available(macOS 13.0, *) {
     let delegate = SenderAppDelegate()
     app.delegate = delegate
     app.run()

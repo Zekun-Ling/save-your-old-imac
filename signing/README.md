@@ -1,20 +1,31 @@
 # Signing
 
-`make-apps.sh` signs both apps with the first "Developer ID Application"
-identity in the login keychain, with the hardened runtime enabled. Without
-one it falls back to ad-hoc signing, which is fine for personal use — the
-only cost is Gatekeeper's right-click → Open step on the first launch on
-another Mac, and macOS forgetting the Screen Recording grant when the
-ad-hoc signature changes across rebuilds.
+For a local build, run:
+
+```sh
+LUNA_ADHOC=1 LUNA_NO_NOTARIZE=1 ./make-apps.sh
+```
+
+This signs both apps ad hoc without looking for a Developer ID identity or
+submitting them to Apple. The current local builds use this path. Their
+signatures have been checked locally; installation on the target iMac has
+not been tested.
+
+Without `LUNA_ADHOC=1`, the script uses the first "Developer ID Application"
+identity in the login keychain, with the hardened runtime enabled. If none
+is available, it falls back to ad hoc signing.
 
 # Notarization
 
-Notarized apps open on other Macs with no Gatekeeper friction at all.
-`make-apps.sh` notarizes and staples both apps whenever a `notarytool`
-keychain profile named `luna` exists (override the name with
-`LUNA_NOTARY_PROFILE`, skip with `LUNA_NO_NOTARIZE=1`). Notarization needs
-network access, an Apple Developer Program membership, and usually takes
-one to a few minutes per submission.
+When using a Developer ID identity, `make-apps.sh` submits both apps for
+notarization if the `notarytool` keychain profile is usable and
+`LUNA_NO_NOTARIZE` is unset. It staples the tickets after Apple accepts the
+submissions. The default profile name is `luna`; override it with
+`LUNA_NOTARY_PROFILE`.
+
+This path needs network access and Apple Developer credentials. It was not
+run during the local validation. A successful local build or signature
+check does not mean the app has been notarized.
 
 One-time setup (the password never touches the repo — `notarytool` stores
 it in the login keychain):

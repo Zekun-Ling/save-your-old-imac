@@ -25,13 +25,15 @@ final class SenderAppDelegate: NSObject, NSApplicationDelegate {
             self?.rebuildMenu()
         }
 
-        browser.onResults = { [weak self] results in
-            self?.results = results
-            self?.rebuildMenu()
+        if !CommandLine.arguments.contains("--test-disconnect") {
+            browser.onResults = { [weak self] results in
+                self?.results = results
+                self?.rebuildMenu()
+            }
+            browser.start()
+            InterfaceMonitor.shared.onChange = { [weak self] in self?.rebuildMenu() }
+            InterfaceMonitor.shared.start()
         }
-        browser.start()
-        InterfaceMonitor.shared.onChange = { [weak self] in self?.rebuildMenu() }
-        InterfaceMonitor.shared.start()
         rebuildMenu()
         startDisconnectTestIfRequested()
     }
@@ -97,7 +99,7 @@ final class SenderAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         let modeMenu = NSMenu()
-        let current = UserDefaults.standard.string(forKey: "preset") ?? DisplayPreset.retina5KScaled.rawValue
+        let current = UserDefaults.standard.string(forKey: "preset") ?? DisplayPreset.plain1440.rawValue
         for preset in DisplayPreset.allCases {
             let item = NSMenuItem(title: preset.title, action: #selector(selectPreset(_:)), keyEquivalent: "")
             item.target = self
@@ -274,6 +276,11 @@ extension SenderAppDelegate {
                 let displayID = session.activeVirtualDisplayID
                 testLog("streaming on display \(displayID), disconnecting in 4s")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [self] in
+                    guard case .streaming = session.state, session.activeVirtualDisplayID == displayID else {
+                        testLog("FAIL — streaming ended before the requested disconnect")
+                        session.disconnect()
+                        exit(1)
+                    }
                     disconnect()  // the same action the menu item fires
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [self] in
                         verifyTeardown(displayID: displayID)
@@ -289,10 +296,11 @@ extension SenderAppDelegate {
     }
 
     private func verifyTeardown(displayID: CGDirectDisplayID) {
-        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
-        var count: UInt32 = 0
-        CGGetOnlineDisplayList(UInt32(ids.count), &ids, &count)
-        let displayGone = !ids.prefix(Int(count)).contains(displayID)
+        guard let online = VirtualDisplaySession.isOnline(displayID) else {
+            testLog("FAIL — could not list online displays")
+            exit(1)
+        }
+        let displayGone = !online
         let idle = session.state == .idle
         if displayGone && idle {
             testLog("PASS — state idle, virtual display \(displayID) removed")

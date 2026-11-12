@@ -13,31 +13,9 @@ final class VirtualDisplaySession {
     /// pixelWidth/pixelHeight are physical pixels. With hiDPI the desktop
     /// "looks like" half that in each dimension (Retina).
     func create(pixelWidth: UInt32, pixelHeight: UInt32, hiDPI: Bool, refreshHz: Double, name: String) -> Bool {
+        destroy()
         let modeWidth = hiDPI ? pixelWidth / 2 : pixelWidth
         let modeHeight = hiDPI ? pixelHeight / 2 : pixelHeight
-        return create(
-            maxPixels: (pixelWidth, pixelHeight),
-            hiDPIValue: hiDPI ? 1 : 0,
-            modes: [(modeWidth, modeHeight)],
-            targetPointWidth: Int(modeWidth),
-            targetPixelWidth: Int(pixelWidth),
-            refreshHz: refreshHz,
-            name: name
-        )
-    }
-
-    func create(
-        maxPixels: (UInt32, UInt32),
-        hiDPIValue: UInt32,
-        modes modesInPoints: [(UInt32, UInt32)],
-        targetPointWidth: Int,
-        targetPixelWidth: Int,
-        refreshHz: Double,
-        name: String
-    ) -> Bool {
-        destroy()
-        let pixelWidth = maxPixels.0
-        let pixelHeight = maxPixels.1
 
         let desc = CGVirtualDisplayDescriptor()
         desc.queue = DispatchQueue.main
@@ -67,10 +45,8 @@ final class VirtualDisplaySession {
         }
 
         let settings = CGVirtualDisplaySettings()
-        settings.hiDPI = hiDPIValue
-        settings.modes = modesInPoints.map {
-            CGVirtualDisplayMode(width: $0.0, height: $0.1, refreshRate: refreshHz)
-        }
+        settings.hiDPI = hiDPI ? 1 : 0
+        settings.modes = [CGVirtualDisplayMode(width: modeWidth, height: modeHeight, refreshRate: refreshHz)]
         guard d.apply(settings) else {
             lunaLog("luna: applySettings failed for virtual display")
             return false
@@ -78,14 +54,24 @@ final class VirtualDisplaySession {
 
         display = d
         displayID = d.displayID
-        selectMode(pointWidth: targetPointWidth, pixelWidth: targetPixelWidth)
-        lunaLog("luna: virtual display created, id=%u %ux%u hiDPI=%u", displayID, pixelWidth, pixelHeight, hiDPIValue)
+        selectMode(pointWidth: Int(modeWidth), pixelWidth: Int(pixelWidth))
+        lunaLog("luna: virtual display created, id=%u %ux%u hiDPI=%u", displayID, pixelWidth, pixelHeight, settings.hiDPI)
         return true
     }
 
-    static func allModes(_ displayID: CGDirectDisplayID) -> [CGDisplayMode] {
+    private static func allModes(_ displayID: CGDirectDisplayID) -> [CGDisplayMode] {
         let options = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
         return (CGDisplayCopyAllDisplayModes(displayID, options) as? [CGDisplayMode]) ?? []
+    }
+
+    /// Query the current display topology; nil means CoreGraphics failed.
+    static func isOnline(_ displayID: CGDirectDisplayID) -> Bool? {
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success else { return nil }
+        if count == 0 { return false }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetOnlineDisplayList(UInt32(ids.count), &ids, &count) == .success else { return nil }
+        return ids.prefix(Int(count)).contains(displayID)
     }
 
     /// The system picks its own default mode; switch to the one we asked for.
@@ -99,8 +85,12 @@ final class VirtualDisplaySession {
         else { return }
         var config: CGDisplayConfigRef?
         guard CGBeginDisplayConfiguration(&config) == .success, let config else { return }
-        CGConfigureDisplayWithDisplayMode(config, displayID, target, nil)
-        if CGCompleteDisplayConfiguration(config, .permanently) != .success {
+        guard CGConfigureDisplayWithDisplayMode(config, displayID, target, nil) == .success else {
+            CGCancelDisplayConfiguration(config)
+            lunaLog("luna: could not configure virtual display mode")
+            return
+        }
+        if CGCompleteDisplayConfiguration(config, .forAppOnly) != .success {
             lunaLog("luna: could not switch virtual display mode")
         }
     }

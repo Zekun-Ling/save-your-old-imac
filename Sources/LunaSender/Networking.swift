@@ -8,53 +8,65 @@ import LunaProto
 /// with prohibitedInterfaceTypes, while a plain host:port dial honors the
 /// prohibition and happily uses a Thunderbolt bridge / Ethernet link.
 final class ServiceResolver {
+    typealias Result = (host: String, port: UInt16, interfaceIndex: UInt32)
+
     private let queue = DispatchQueue(label: "luna.resolver")
     private var ref: DNSServiceRef?
-    private let completion: ((host: String, port: UInt16)?) -> Void
+    private let completion: (ServiceResolver, Result?) -> Void
     private var finished = false
 
     /// completion fires exactly once, on the main queue; nil on failure.
-    init(completion: @escaping ((host: String, port: UInt16)?) -> Void) {
+    init(completion: @escaping (ServiceResolver, Result?) -> Void) {
         self.completion = completion
     }
 
-    func resolve(name: String, type: String, domain: String, timeout: TimeInterval = 2.0) {
-        let context = Unmanaged.passRetained(self).toOpaque()
-        var r: DNSServiceRef?
-        let err = DNSServiceResolve(
-            &r, 0, 0, name, type, domain,
-            { _, _, _, errorCode, _, hosttarget, portNBO, _, _, context in
-                guard let context else { return }
-                let me = Unmanaged<ServiceResolver>.fromOpaque(context).takeUnretainedValue()
-                if errorCode == kDNSServiceErr_NoError, let hosttarget {
-                    me.finish((String(cString: hosttarget), UInt16(bigEndian: portNBO)))
-                } else {
-                    me.finish(nil)
-                }
-            },
-            context
-        )
-        guard err == kDNSServiceErr_NoError, let r else {
-            Unmanaged<ServiceResolver>.fromOpaque(context).release()
-            DispatchQueue.main.async { self.completion(nil) }
-            return
-        }
-        ref = r
-        DNSServiceSetDispatchQueue(r, queue)
-        queue.asyncAfter(deadline: .now() + timeout) { [weak self] in self?.finish(nil) }
-    }
-
-    private func finish(_ result: (host: String, port: UInt16)?) {
+    func resolve(name: String, type: String, domain: String, interfaceIndex: UInt32, timeout: TimeInterval = 2.0) {
         queue.async {
             guard !self.finished else { return }
-            self.finished = true
-            if let ref = self.ref {
-                DNSServiceRefDeallocate(ref)
-                self.ref = nil
+            let context = Unmanaged.passRetained(self).toOpaque()
+            var ref: DNSServiceRef?
+            let error = DNSServiceResolve(
+                &ref, 0, interfaceIndex, name, type, domain,
+                { _, _, index, error, _, host, port, _, _, context in
+                    guard let context else { return }
+                    let resolver = Unmanaged<ServiceResolver>.fromOpaque(context).takeUnretainedValue()
+                    let result: Result?
+                    if error == kDNSServiceErr_NoError, let host {
+                        result = (String(cString: host), UInt16(bigEndian: port), index)
+                    } else {
+                        result = nil
+                    }
+                    resolver.queue.async { resolver.finish(result) }
+                },
+                context
+            )
+            guard error == kDNSServiceErr_NoError, let ref else {
+                Unmanaged<ServiceResolver>.fromOpaque(context).release()
+                self.finish(nil)
+                return
             }
-            DispatchQueue.main.async { self.completion(result) }
+            self.ref = ref
+            guard DNSServiceSetDispatchQueue(ref, self.queue) == kDNSServiceErr_NoError else {
+                self.finish(nil)
+                return
+            }
+            self.queue.asyncAfter(deadline: .now() + timeout) { [weak self] in self?.finish(nil) }
+        }
+    }
+
+    func cancel() {
+        queue.async { self.finish(nil) }
+    }
+
+    private func finish(_ result: Result?) {
+        guard !finished else { return }
+        finished = true
+        if let ref {
+            DNSServiceRefDeallocate(ref)
+            self.ref = nil
             Unmanaged.passUnretained(self).release()  // balances passRetained
         }
+        DispatchQueue.main.async { self.completion(self, result) }
     }
 }
 
@@ -113,7 +125,7 @@ final class SenderConnection {
         return pending
     }
 
-    var onReady: (() -> Void)?          // main queue
+    var onReady: ((NWInterface?) -> Void)?  // main queue
     var onClosed: ((String?) -> Void)?  // main queue
     var onMessage: ((LunaMessage) -> Void)?  // main queue
 
@@ -121,9 +133,8 @@ final class SenderConnection {
     private let wiredOnly: Bool
     private let pinned: Bool
     private var becameReady = false  // touched only on `queue`
-    /// Interface of the path the connection became ready on. Written on
-    /// `queue` just before onReady is dispatched, read on the main queue.
-    private(set) var readyInterface: NWInterface?
+    private var receivedCaps = false  // touched only on `queue`
+    private var transportSample: NWConnection.PendingDataTransferReport?  // only on `queue`
 
     /// wiredOnly: refuse Wi-Fi paths and give up quickly, so the caller can
     /// probe for a Thunderbolt bridge / Ethernet link before falling back.
@@ -135,6 +146,8 @@ final class SenderConnection {
         tcp.noDelay = true
         tcp.enableKeepalive = true
         tcp.keepaliveIdle = 5
+        tcp.keepaliveInterval = 2
+        tcp.keepaliveCount = 3
         let params = NWParameters(tls: nil, tcp: tcp)
         if wiredOnly {
             params.prohibitedInterfaceTypes = [.wifi, .cellular]
@@ -150,9 +163,11 @@ final class SenderConnection {
             guard let self else { return }
             switch state {
             case .ready:
+                guard !self.becameReady else { return }
                 self.becameReady = true
-                self.readyInterface = self.connection.currentPath?.availableInterfaces.first
-                DispatchQueue.main.async { self.onReady?() }
+                let interface = NetInfo.interface(for: self.connection.currentPath)
+                DispatchQueue.main.async { self.onReady?(interface) }
+                if LatencyTrace.enabled { self.sampleTransportRTT() }
             case .waiting(let error):
                 // Normal connects ride out .waiting; the wired probe and a
                 // pinned interface treat "no usable path" as an immediate miss.
@@ -161,8 +176,10 @@ final class SenderConnection {
                     self.connection.cancel()
                 }
             case .failed(let error):
+                self.transportSample = nil
                 self.close(reason: error.localizedDescription)
             case .cancelled:
+                self.transportSample = nil
                 self.close(reason: nil)
             default:
                 break
@@ -185,26 +202,36 @@ final class SenderConnection {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 16) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             if let data, !data.isEmpty {
-                for msg in self.parser.feed(data) {
-                    DispatchQueue.main.async { self.onMessage?(msg) }
-                }
+                let messages = self.parser.feed(data)
                 if self.parser.corrupted {
                     self.close(reason: "stream out of sync (oversized frame)")
+                    self.connection.cancel()
                     return
+                }
+                // Only one caps message is used by the sender. Do not let a
+                // peer queue arbitrary messages onto the main thread.
+                if !self.receivedCaps, let caps = messages.first(where: {
+                    if case .caps = $0 { return true }
+                    return false
+                }) {
+                    self.receivedCaps = true
+                    DispatchQueue.main.async { self.onMessage?(caps) }
                 }
             }
             if isComplete || error != nil {
                 self.close(reason: error?.localizedDescription ?? "receiver disconnected")
+                self.connection.cancel()
                 return
             }
             self.receiveLoop()
         }
     }
 
-    func send(_ data: Data) {
+    func send(_ data: Data, ptsMicros: Int64? = nil) {
         pendingLock.lock()
         pending += data.count
         pendingLock.unlock()
+        if let ptsMicros { LatencyTrace.mark(.sent, ptsMicros: ptsMicros) }
         connection.send(content: data, completion: .contentProcessed { [weak self] _ in
             guard let self else { return }
             self.pendingLock.lock()
@@ -215,6 +242,22 @@ final class SenderConnection {
 
     func cancel() {
         connection.cancel()
+    }
+
+    private func sampleTransportRTT() {
+        transportSample = connection.startDataTransferReport()
+        queue.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, let sample = self.transportSample else { return }
+            self.transportSample = nil
+            sample.collect(queue: self.queue) { report in
+                for path in report.pathReports where path.sentApplicationByteCount > 0 {
+                    let interface = path.interface
+                    lunaLog("luna: TCP RTT via %@ (type %@): smoothed %.2f ms, minimum %.2f ms",
+                            NetInfo.label(bsd: interface.name, type: interface.type), String(describing: interface.type),
+                            path.transportSmoothedRTT * 1_000, path.transportMinimumRTT * 1_000)
+                }
+            }
+        }
     }
 
     private func close(reason: String?) {
