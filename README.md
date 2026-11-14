@@ -8,18 +8,17 @@ The MacBook creates an extra desktop and sends its picture over the local
 network. The iMac runs a receiver to display it. Both Macs need to be
 running; this does not turn the iMac's port into a video input.
 
-**Status:** the sender and receiver pass local tests on an Apple Silicon
-MacBook, including capture, streaming and disconnect cleanup. Testing on
-the 2013 iMac over Thunderbolt is still pending. See [test results](TESTING.md)
-for the setup and measurement limits.
+**Tested setup:** an M2 MacBook Air extended its desktop to a 2013 iMac at
+2560 × 1440 over Thunderbolt Bridge. A 30-second playback test completed and
+the virtual display was removed on disconnect. See [test results](TESTING.md)
+for the setup and timings.
 
 ## Requirements
 
 - **Sender** — macOS 13 or newer, with ScreenCaptureKit and VideoToolbox H.264
   encoding support.
 - **Receiver** — the Intel build targets macOS 10.15 Catalina and newer.
-  The universal app also contains an Apple Silicon build. The Catalina
-  target has been checked in the binary, but not yet tested on the iMac.
+  The universal app also contains an Apple Silicon build.
 - Both Macs need a route to each other over a trusted local network. The
   stream uses TCP without TLS or peer authentication.
 
@@ -55,10 +54,11 @@ uses Ethernet or Thunderbolt Bridge as a network link. The sender menu
 shows the interface used for an established connection when macOS reports it.
 
 Wi-Fi and Thunderbolt Bridge can both provide the local network connection.
-For the intended M2 MacBook Air to 2013 iMac setup, the Thunderbolt path
-uses an Apple Thunderbolt 3-to-2 adapter and a Thunderbolt cable. A Mini
-DisplayPort cable with the same connector shape cannot create that network
-link. This two-Mac Thunderbolt setup has not yet been validated here.
+The M2 MacBook Air to 2013 iMac setup uses an Apple Thunderbolt 3-to-2
+adapter and a Thunderbolt cable. For a wired-only connection, choose
+**Network Interface → Thunderbolt Bridge** when the receiver appears. A
+Mini DisplayPort cable with the same connector shape cannot create that
+network link.
 
 The receiver starts fullscreen. Press **⌘⇧F** to toggle windowed mode.
 **Esc** returns from windowed mode to fullscreen and quits from fullscreen.
@@ -112,12 +112,9 @@ debugging the initial app.
 
 - Fixed connection cleanup and capture startup handling, and added checks
   for invalid video data before passing it to the display layer.
-- Made interface selection stricter and improved reporting of the network
-  route used by an established connection.
+- Made interface selection stricter, added direct Thunderbolt Bridge links
+  from Bonjour to the interface menu, and improved route reporting.
 - Reduced buffer copying when parsing batches of messages, added optional
   latency traces, and made the display self-test check all three presets.
 - Changed packaging to build local apps without replacing installed copies
   or resetting Screen Recording permissions.
-
-These changes have passed local tests on the MacBook. Testing on the target
-iMac and its Thunderbolt connection is still pending.

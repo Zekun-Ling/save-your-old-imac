@@ -26,16 +26,22 @@ final class SenderAppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if !CommandLine.arguments.contains("--test-disconnect") {
-            browser.onResults = { [weak self] results in
-                self?.results = results
-                self?.rebuildMenu()
-            }
-            browser.start()
+            startReceiverDiscovery()
             InterfaceMonitor.shared.onChange = { [weak self] in self?.rebuildMenu() }
             InterfaceMonitor.shared.start()
         }
         rebuildMenu()
         startDisconnectTestIfRequested()
+    }
+
+    private func startReceiverDiscovery() {
+        browser.onResults = { [weak self] results in
+            guard let self else { return }
+            self.results = results
+            InterfaceMonitor.shared.updateDiscoveredInterfaces(results.flatMap { $0.interfaces })
+            self.rebuildMenu()
+        }
+        browser.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -228,6 +234,7 @@ final class SenderAppDelegate: NSObject, NSApplicationDelegate {
 // `--test-disconnect host:port` connects to a receiver, streams briefly,
 // then invokes the same disconnect action as the menu item and verifies
 // full teardown (state idle, virtual display gone). Exits 0 on PASS.
+// LUNA_TEST_STREAM_SECONDS overrides the 4-second stream window (1...120).
 @available(macOS 12.3, *)
 extension SenderAppDelegate {
     private var testLogURL: URL? {
@@ -257,25 +264,58 @@ extension SenderAppDelegate {
             testLog("bad address \(address)")
             exit(2)
         }
+        let durationText = ProcessInfo.processInfo.environment["LUNA_TEST_STREAM_SECONDS"] ?? "4"
+        guard let streamSeconds = TimeInterval(durationText), streamSeconds.isFinite,
+              (1...120).contains(streamSeconds) else {
+            testLog("invalid LUNA_TEST_STREAM_SECONDS (expected a finite number from 1 to 120)")
+            exit(2)
+        }
         let existing = session.onStateChange
         session.onStateChange = { [weak self] state in
             existing?(state)
             self?.testLog("state -> \(state)")
         }
         testLog("connecting to \(address)")
-        session.connect(
+        let pin = SessionController.pinnedInterfaceName
+        if let pin {
+            // Direct links may only appear in Bonjour results, rather than
+            // the default path monitor. Wait for either snapshot below.
+            InterfaceMonitor.shared.start()
+            startReceiverDiscovery()
+            testLog("waiting up to 5s for pinned interface \(pin)")
+        }
+        connectDisconnectTest(
             endpoint: .hostPort(host: NWEndpoint.Host(String(parts[0])), port: port),
-            name: "test"
+            pin: pin, streamSeconds: streamSeconds, interfaceDeadline: .now() + 5
         )
-        pollForStreaming(deadline: Date().addingTimeInterval(30))
     }
 
-    private func pollForStreaming(deadline: Date) {
+    private func connectDisconnectTest(endpoint: NWEndpoint, pin: String?,
+                                       streamSeconds: TimeInterval, interfaceDeadline: DispatchTime) {
+        if let pin, InterfaceMonitor.shared.interface(named: pin) == nil {
+            guard DispatchTime.now() < interfaceDeadline else {
+                testLog("FAIL — pinned interface \(pin) did not become available within 5s")
+                exit(1)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [self] in
+                connectDisconnectTest(endpoint: endpoint, pin: pin,
+                                      streamSeconds: streamSeconds, interfaceDeadline: interfaceDeadline)
+            }
+            return
+        }
+        session.connect(
+            endpoint: endpoint,
+            name: "test"
+        )
+        pollForStreaming(deadline: Date().addingTimeInterval(30), streamSeconds: streamSeconds)
+    }
+
+    private func pollForStreaming(deadline: Date, streamSeconds: TimeInterval) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
             if case .streaming = session.state {
                 let displayID = session.activeVirtualDisplayID
-                testLog("streaming on display \(displayID), disconnecting in 4s")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [self] in
+                testLog("streaming on display \(displayID), disconnecting in \(streamSeconds)s")
+                DispatchQueue.main.asyncAfter(deadline: .now() + streamSeconds) { [self] in
                     guard case .streaming = session.state, session.activeVirtualDisplayID == displayID else {
                         testLog("FAIL — streaming ended before the requested disconnect")
                         session.disconnect()
@@ -287,7 +327,7 @@ extension SenderAppDelegate {
                     }
                 }
             } else if Date() < deadline {
-                pollForStreaming(deadline: deadline)
+                pollForStreaming(deadline: deadline, streamSeconds: streamSeconds)
             } else {
                 testLog("FAIL — never reached streaming (screen-recording permission missing?)")
                 exit(1)

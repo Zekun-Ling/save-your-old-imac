@@ -245,17 +245,21 @@ final class SenderConnection {
     }
 
     private func sampleTransportRTT() {
+        guard case .ready = connection.state else { return }
         transportSample = connection.startDataTransferReport()
         queue.asyncAfter(deadline: .now() + 2) { [weak self] in
-            guard let self, let sample = self.transportSample else { return }
+            guard let self, case .ready = self.connection.state,
+                  let sample = self.transportSample else { return }
             self.transportSample = nil
-            sample.collect(queue: self.queue) { report in
+            sample.collect(queue: self.queue) { [weak self] report in
+                guard let self, case .ready = self.connection.state else { return }
                 for path in report.pathReports where path.sentApplicationByteCount > 0 {
                     let interface = path.interface
                     lunaLog("luna: TCP RTT via %@ (type %@): smoothed %.2f ms, minimum %.2f ms",
                             NetInfo.label(bsd: interface.name, type: interface.type), String(describing: interface.type),
                             path.transportSmoothedRTT * 1_000, path.transportMinimumRTT * 1_000)
                 }
+                self.sampleTransportRTT()
             }
         }
     }
